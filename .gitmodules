@@ -1,0 +1,4 @@
+[submodule "lib/slam-sigsim"]
+ path = lib/slam-sigsim
+ url = https://github.com/blfitzgerald/SLAM-SIGSIM.git
+ branch = main
