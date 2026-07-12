@@ -280,6 +280,9 @@ def run_aorc_to_daily_nc(action):
 
     Attributes:
       source        "mirror" (default) | "public"
+      aorc_store    name of the declared AORC store for source="mirror" (default
+                    "AORC"); its profile picks the bucket/endpoint/creds env and
+                    its root is the cache prefix. Env AORC_* is used if absent.
       precvar       precip variable name (default APCP_surface)
       start_date    ISO date, first day to convert (inclusive)
       end_date      ISO date, last day to convert (inclusive)
@@ -289,6 +292,7 @@ def run_aorc_to_daily_nc(action):
       resample_agg  block reducer for resampling: "mean" (default), "sum", "max"
     Input datasource:  search_filter  (a geojson defining the clip region)
     Output datasource: daily_netcdf   (destination prefix for AORC.YYYYMMDD.nc)
+    Store (mirror):    AORC            (storm-cloud bucket, root = aorc-cache-conus)
     """
     import geopandas as gpd
 
@@ -316,6 +320,31 @@ def run_aorc_to_daily_nc(action):
     bbox = (minx - buffer_deg, miny - buffer_deg, maxx + buffer_deg, maxy + buffer_deg)
     logger.info(f"search-filter bbox (+{buffer_deg} deg): {bbox}")
 
+    # The AORC mirror lives in its own store/bucket (NOT the FFRD model store).
+    # Read the location from the declared AORC store: bucket comes from its
+    # profile's <PROFILE>_AWS_S3_BUCKET, and the store root is the cache prefix.
+    # Fall back to the AORC_* env convention if no store is declared. (source
+    # "public" ignores these and reads the anonymous NOAA bucket.)
+    aorc_store_name = str(a.get("aorc_store", "AORC"))
+    store = action._iomgr.get_store(aorc_store_name)
+    if store is not None:
+        prof = store.profile
+        aorc_bucket = os.environ.get(f"{prof}_AWS_S3_BUCKET")
+        aorc_prefix = (store.params or {}).get("root", "")
+        aorc_endpoint = os.environ.get(f"{prof}_AWS_ENDPOINT")
+        aorc_key = os.environ.get(f"{prof}_AWS_ACCESS_KEY_ID")
+        aorc_secret = os.environ.get(f"{prof}_AWS_SECRET_ACCESS_KEY")
+        logger.info(
+            f"AORC mirror store '{aorc_store_name}' (profile {prof}): "
+            f"bucket={aorc_bucket} root={aorc_prefix}"
+        )
+    else:
+        aorc_bucket = os.environ.get("AORC_AWS_S3_BUCKET")
+        aorc_prefix = os.environ.get("AORC_S3_PREFIX", "")
+        aorc_endpoint = os.environ.get("AORC_AWS_ENDPOINT")
+        aorc_key = os.environ.get("AORC_AWS_ACCESS_KEY_ID")
+        aorc_secret = os.environ.get("AORC_AWS_SECRET_ACCESS_KEY")
+
     outdir = "/data/precip-out"
     zarr_to_daily_netcdf(
         source=source,
@@ -326,11 +355,11 @@ def run_aorc_to_daily_nc(action):
         outdir=outdir,
         resample_km=resample_km,
         resample_agg=resample_agg,
-        aorc_bucket=os.environ.get("AORC_AWS_S3_BUCKET"),
-        aorc_prefix=os.environ.get("AORC_S3_PREFIX", ""),
-        aorc_endpoint=os.environ.get("AORC_AWS_ENDPOINT"),
-        aorc_key=os.environ.get("AORC_AWS_ACCESS_KEY_ID"),
-        aorc_secret=os.environ.get("AORC_AWS_SECRET_ACCESS_KEY"),
+        aorc_bucket=aorc_bucket,
+        aorc_prefix=aorc_prefix,
+        aorc_endpoint=aorc_endpoint,
+        aorc_key=aorc_key,
+        aorc_secret=aorc_secret,
     )
     _put_output_folder(action, "daily_netcdf", outdir)
 
