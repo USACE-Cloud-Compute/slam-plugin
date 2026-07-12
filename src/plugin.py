@@ -7,7 +7,7 @@ import datetime as dt
 
 import numpy as np
 
-from cc.plugin_manager import PluginManager
+from cc.plugin_manager import PluginManager, DataSourceOpInput
 from cc.datastore_s3 import S3DataStore
 
 logger = logging.getLogger(__name__)
@@ -27,48 +27,95 @@ PUBLIC_AORC_BUCKET = "noaa-nws-aorc-v1-1-1km"
 # ---------------------------------------------------------------------------
 # Datastore helpers
 #
-# The published cc_py_sdk (v1.1.0) only connects a live boto3 _session for
-# payload-level stores, and its action IO resolves against action-private
-# stores/datasources. So actions that carry their own stores must have the
-# session connected lazily here, and multi-file transfers need folder-aware
-# up/download (the SDK ships put_folder but no folder download, and get_dir
-# raises KeyError on prefixes without sub-prefixes). These helpers provide
-# both and are used by every action below.
+# Every action carries its OWN stores/inputs/outputs (the published cc_py_sdk
+# v1.1.0 resolves action IO against action-private stores/datasources with no
+# payload-level fallback), so all transfers below go through the SDK's built-in
+# io manager on the Action object:
+#
+#   action.copy_file_to_local(DataSourceOpInput(name, pathkey, datakey), path)
+#   action.copy_file_to_remote(DataSourceOpInput(name, pathkey, datakey), path)
+#   action.copy_folder_to_remote(DataSourceOpInput(name, pathkey, datakey), dir)
+#
+# DataSourceOpInput selects a datasource by name and a single named path key,
+# so a datasource that declares several named paths (an ESRI shapefile's
+# shp/shx/dbf/prj) is fetched/staged one path key at a time.
+#
+# Two SDK gaps this module works around:
+#   1. PluginManager.connect() only wires a live boto3 _session onto PAYLOAD
+#      stores, never action stores -> _connect_action_stores() connects them so
+#      the io-manager methods (which call store._session) work.
+#   2. The SDK ships put_folder / copy_folder_to_remote but NO folder DOWNLOAD
+#      (get_dir only lists; get_object is single-key) -> _get_folder() pages the
+#      prefix on the connected session. It also uses action._iomgr.get_store(),
+#      NOT action.get_store(), because Action.get_store() is a no-arg bug in the
+#      SDK that returns the bound method instead of the store.
+#
+# Path-key convention (kept in lockstep with slam-compute-manifest.json):
+#   single geojson file -> "geo-json"
+#   ESRI shapefile      -> "shp","shx","dbf","prj"   (.prj REQUIRED: SLAM's
+#                          shapefile_to_mask raises on a null CRS)
+#   directory of files  -> "directory"
 # ---------------------------------------------------------------------------
-def _connected_store(owner, store_name):
-    """Resolve a store from an action/payload and ensure its S3 session is live."""
-    store = owner._iomgr.get_store(store_name)
-    if store is None:
-        raise ValueError(f"store '{store_name}' not found on this action/payload")
-    if getattr(store, "_session", None) is None:
-        session = S3DataStore()
-        session.connect(store)
-        store._session = session
-    return store
+SHP_COMPONENTS = ("shp", "shx", "dbf", "prj")
 
 
-def _get_input_file(action, ds_name, localpath, pathkey="default"):
-    """Download a single input object to localpath."""
-    ds = action.get_input_data_source(ds_name)
-    if ds is None:
-        raise ValueError(f"input data source '{ds_name}' not defined on action")
-    store = _connected_store(action, ds.store_name)
-    key = store.full_path(ds.paths[pathkey])
-    reader = store._session.get(key, None)
+def _connect_action_stores(action):
+    """Connect a live S3 session onto every action-scoped store. PluginManager
+    only connects payload-level stores, so without this the built-in io-manager
+    methods would hit an unset store._session on action stores.
+
+    Tolerant by design: a declared store may not be exercised by a given run
+    (e.g. the AORC store is unused when aorc_to_daily_nc has source='public'),
+    so a connect failure (missing creds env for that profile) is logged and
+    skipped rather than aborting the action. A store that IS needed but failed
+    to connect surfaces at first use."""
+    for store in action._iomgr.stores or []:
+        if getattr(store, "_session", None) is None:
+            try:
+                session = S3DataStore()
+                session.connect(store)
+                store._session = session
+            except Exception as e:
+                logger.warning(
+                    f"store '{store.name}' (profile {store.profile}) not connected: {e}"
+                )
+
+
+def _get_file(action, ds_name, localpath, pathkey="geo-json"):
+    """Download a single input object (one named path key) to localpath."""
     os.makedirs(os.path.dirname(localpath) or ".", exist_ok=True)
-    with open(localpath, "wb") as f:
-        shutil.copyfileobj(reader, f)
-    logger.info(f"downloaded s3 object {key} -> {localpath}")
+    action.copy_file_to_local(DataSourceOpInput(ds_name, pathkey, None), localpath)
+    logger.info(f"downloaded input '{ds_name}'[{pathkey}] -> {localpath}")
     return localpath
 
 
-def _get_input_folder(action, ds_name, localdir, pathkey="default"):
-    """Download every object under an input datasource prefix into localdir
-    (flattened, preserving the key suffix below the prefix)."""
+def _get_shapefile(action, ds_name, localdir, stem="WS", components=SHP_COMPONENTS):
+    """Download an ESRI shapefile datasource, one sidecar per named path key, to
+    localdir/<stem>.<ext>. The local stem is fixed (SLAM hard-codes 'WS.shp'),
+    independent of the remote object names."""
+    os.makedirs(localdir, exist_ok=True)
+    out = {}
+    for ext in components:
+        dest = os.path.join(localdir, f"{stem}.{ext}")
+        action.copy_file_to_local(DataSourceOpInput(ds_name, ext, None), dest)
+        out[ext] = dest
+    logger.info(
+        f"downloaded shapefile '{ds_name}' -> {localdir}/{stem}.{{{','.join(components)}}}"
+    )
+    return out
+
+
+def _get_folder(action, ds_name, localdir, pathkey="directory"):
+    """Download every object under a directory datasource prefix into localdir
+    (flattened, preserving the key suffix below the prefix). The SDK has no
+    folder download, so page the prefix on the connected store session."""
     ds = action.get_input_data_source(ds_name)
     if ds is None:
         raise ValueError(f"input data source '{ds_name}' not defined on action")
-    store = _connected_store(action, ds.store_name)
+    _connect_action_stores(action)
+    store = action._iomgr.get_store(ds.store_name)
+    if store is None:
+        raise ValueError(f"store '{ds.store_name}' not found on this action")
     prefix = store.full_path(ds.paths[pathkey]).removeprefix("/")
     if not prefix.endswith("/"):
         prefix += "/"
@@ -92,29 +139,21 @@ def _get_input_folder(action, ds_name, localdir, pathkey="default"):
     return files
 
 
-def _put_output_folder(action, ds_name, localdir, pathkey="default"):
-    """Upload the contents of localdir under an output datasource prefix."""
-    ds = action.get_output_data_source(ds_name)
-    if ds is None:
-        raise ValueError(f"output data source '{ds_name}' not defined on action")
-    store = _connected_store(action, ds.store_name)
-    prefix = store.full_path(ds.paths[pathkey])
-    keys = store._session.put_folder(localdir, prefix)
-    logger.info(f"uploaded {localdir} -> {prefix} ({len(keys)} object(s))")
-    return keys
+def _put_folder(action, ds_name, localdir, pathkey="directory"):
+    """Upload the contents of localdir under an output directory datasource."""
+    action.copy_folder_to_remote(DataSourceOpInput(ds_name, pathkey, None), localdir)
+    logger.info(f"uploaded {localdir} -> output '{ds_name}'[{pathkey}]")
 
 
-def _put_output_file(action, ds_name, localpath, pathkey="default"):
-    """Upload a single local file to an output datasource key."""
-    ds = action.get_output_data_source(ds_name)
-    if ds is None:
-        raise ValueError(f"output data source '{ds_name}' not defined on action")
-    store = _connected_store(action, ds.store_name)
-    key = store.full_path(ds.paths[pathkey])
-    with open(localpath, "rb") as f:
-        store._session.put(f, key, None)
-    logger.info(f"uploaded {localpath} -> {key}")
-    return key
+def _put_shapefile(action, ds_name, localdir, stem, components=SHP_COMPONENTS):
+    """Upload an ESRI shapefile, one produced sidecar per named output path key."""
+    for ext in components:
+        src = os.path.join(localdir, f"{stem}.{ext}")
+        if not os.path.exists(src):
+            logger.warning(f"{ds_name}: expected sidecar {src} not found; skipping")
+            continue
+        action.copy_file_to_remote(DataSourceOpInput(ds_name, ext, None), src)
+    logger.info(f"uploaded shapefile {localdir}/{stem}.* -> output '{ds_name}'")
 
 
 # ---------------------------------------------------------------------------
@@ -310,10 +349,12 @@ def run_aorc_to_daily_nc(action):
             "aorc_to_daily_nc requires 'start_date' and 'end_date' attributes"
         )
 
+    _connect_action_stores(action)
+
     work = "/data/aorc"
     os.makedirs(work, exist_ok=True)
     filter_path = os.path.join(work, "search-filter.geojson")
-    _get_input_file(action, "search_filter", filter_path)
+    _get_file(action, "search_filter", filter_path, pathkey="geo-json")
 
     gdf = gpd.read_file(filter_path).to_crs(4326)
     minx, miny, maxx, maxy = gdf.total_bounds
@@ -361,21 +402,23 @@ def run_aorc_to_daily_nc(action):
         aorc_key=aorc_key,
         aorc_secret=aorc_secret,
     )
-    _put_output_folder(action, "daily_netcdf", outdir)
+    _put_folder(action, "daily_netcdf", outdir)
 
 
 def run_geojson_to_shp(action):
     """Action (optional): convert a watershed geojson to an ESRI shapefile and
-    stage WS.shp + sidecars to the destination datalocation used as
+    stage WS.{shp,shx,dbf,prj} to the destination datalocation read as
     'watershed_shapefile' by PP2WAP / LMC / CLMPV.
 
     Attributes:
-      shp_name    output shapefile stem (default WS)
+      shp_name    local shapefile stem written before upload (default WS); the
+                  remote object names come from the output datasource path keys.
       target_crs  CRS to write (default EPSG:4326, to match the AORC grid)
-    Input datasource:  watershed_geojson
-    Output datasource: watershed_shp
+    Input datasource:  watershed  (path key 'geo-json')
+    Output datasource: watershed  (path keys 'shp','shx','dbf','prj')
     """
     logger.info("ACTION: geojson_to_shp")
+    _connect_action_stores(action)
     a = action.attributes
     stem = str(a.get("shp_name", "WS"))
     target_crs = a.get("target_crs", "EPSG:4326")
@@ -384,10 +427,10 @@ def run_geojson_to_shp(action):
     shpdir = os.path.join(work, "shp")
     os.makedirs(shpdir, exist_ok=True)
     gj = os.path.join(work, "input.geojson")
-    _get_input_file(action, "watershed_geojson", gj)
+    _get_file(action, "watershed", gj, pathkey="geo-json")
 
     geojson_to_shapefile(gj, os.path.join(shpdir, f"{stem}.shp"), target_crs=target_crs)
-    _put_output_folder(action, "watershed_shp", shpdir)
+    _put_shapefile(action, "watershed", shpdir, stem)
 
 
 # ---------------------------------------------------------------------------
@@ -397,11 +440,12 @@ def run_pp2wap(action):
     logger.info("STAGE 1: PP2WAP")
     attrs = action.attributes
 
+    _connect_action_stores(action)
     os.makedirs("/data", exist_ok=True)
     # daily precip NetCDFs (produced by aorc_to_daily_nc) + watershed sidecars,
     # both staged into the working dir where 1.PP2WAP.py globs '*.nc' and reads WS.shp.
-    _get_input_folder(action, "precipitation", "/data")
-    _get_input_folder(action, "watershed_shapefile", "/data")
+    _get_folder(action, "precipitation", "/data")
+    _get_shapefile(action, "watershed_shapefile", "/data", stem="WS")
 
     script = os.path.join(SLAM_SUBMODULE_PATH, "1.PP2WAP.py")
     cmd = [
@@ -429,8 +473,9 @@ def run_amc(action):
     logger.info("STAGE 2: AMC")
     attrs = action.attributes
 
+    _connect_action_stores(action)
     os.makedirs("/data/wap", exist_ok=True)
-    _get_input_folder(action, "wap_input", "/data/wap")
+    _get_folder(action, "wap_input", "/data/wap")
 
     script = os.path.join(SLAM_SUBMODULE_PATH, "2.AMC.py")
     cmd = [
@@ -459,10 +504,11 @@ def run_lmc(action):
     logger.info("STAGE 3: LMC")
     attrs = action.attributes
 
+    _connect_action_stores(action)
     os.makedirs("/data/lmc/precip", exist_ok=True)
-    _get_input_folder(action, "annual_maxima", "/data/lmc")
-    _get_input_folder(action, "raw_precipitation", "/data/lmc/precip")
-    _get_input_folder(action, "watershed_shapefile", "/data/lmc")
+    _get_folder(action, "annual_maxima", "/data/lmc")
+    _get_folder(action, "raw_precipitation", "/data/lmc/precip")
+    _get_shapefile(action, "watershed_shapefile", "/data/lmc", stem="WS")
 
     script = os.path.join(SLAM_SUBMODULE_PATH, "3.LMC.py")
     cmd = [
@@ -495,10 +541,11 @@ def run_clmpv(action):
     logger.info("STAGE 4: CLMPV")
     attrs = action.attributes
 
+    _connect_action_stores(action)
     os.makedirs("/data/clmpv", exist_ok=True)
-    _get_input_folder(action, "lm_files", "/data/clmpv")
-    _get_input_folder(action, "wsam_files", "/data/clmpv")
-    _get_input_folder(action, "watershed_shapefile", "/data/clmpv")
+    _get_folder(action, "lm_files", "/data/clmpv")
+    _get_folder(action, "wsam_files", "/data/clmpv")
+    _get_shapefile(action, "watershed_shapefile", "/data/clmpv", stem="WS")
 
     values_path = "-"
     domain_mode = attrs.get("domain_mode", "SIM")
@@ -555,7 +602,7 @@ def _stage_dir_to_remote(action, ds_name, base, files):
     os.makedirs(staging, exist_ok=True)
     for f in files:
         shutil.copy2(f, os.path.join(staging, os.path.basename(f)))
-    _put_output_folder(action, ds_name, staging)
+    _put_folder(action, ds_name, staging)
     shutil.rmtree(staging, ignore_errors=True)
 
 
