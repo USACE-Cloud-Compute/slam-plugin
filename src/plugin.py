@@ -139,6 +139,36 @@ def _get_folder(action, ds_name, localdir, pathkey="directory"):
     return files
 
 
+def _get_first_from_folder(action, ds_name, localpath, pathkey="directory"):
+    """Download the first object under a directory datasource prefix to
+    localpath. Used when only a single sample file is needed (e.g. a precip
+    grid reference), avoiding a full folder pull."""
+    ds = action.get_input_data_source(ds_name)
+    if ds is None:
+        raise ValueError(f"input data source '{ds_name}' not defined on action")
+    _connect_action_stores(action)
+    store = action._iomgr.get_store(ds.store_name)
+    if store is None:
+        raise ValueError(f"store '{ds.store_name}' not found on this action")
+    prefix = store.full_path(ds.paths[pathkey]).removeprefix("/")
+    if not prefix.endswith("/"):
+        prefix += "/"
+    fs = store._session.filestore
+    os.makedirs(os.path.dirname(localpath) or ".", exist_ok=True)
+    paginator = fs.client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=fs.bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith("/"):
+                continue
+            reader = fs.get_object(key)
+            with open(localpath, "wb") as f:
+                shutil.copyfileobj(reader, f)
+            logger.info(f"downloaded sample object {key} -> {localpath}")
+            return localpath
+    raise ValueError(f"no objects found under '{ds_name}' prefix {prefix}")
+
+
 def _put_folder(action, ds_name, localdir, pathkey="directory"):
     """Upload the contents of localdir under an output directory datasource."""
     action.copy_folder_to_remote(DataSourceOpInput(ds_name, pathkey, None), localdir)
@@ -492,12 +522,16 @@ def run_amc(action):
     if result != 0:
         raise RuntimeError(f"AMC failed with return code {result}")
 
-    _stage_dir_to_remote(
-        action,
-        "am_output",
-        "/data/wap",
-        glob.glob("/data/wap/Maximum.*.nc4") + glob.glob("/data/wap/*Maximum.*.nc4"),
-    )
+    # AMC (2.AMC.py) writes "<amkey>Maximum.<year>.<outkey>.nc4", but LMC
+    # (3.LMC.py:54) and the LMCol->LMs combine both glob "*Maxima.*.nc4" --
+    # AMC's "Maximum" is the lone naming inconsistency in the SLAM chain.
+    # Rename before staging so every downstream consumer finds the file.
+    am_files = []
+    for f in glob.glob("/data/wap/*Maximum*.nc4"):
+        renamed = f.replace("Maximum", "Maxima")
+        os.rename(f, renamed)
+        am_files.append(renamed)
+    _stage_dir_to_remote(action, "am_output", "/data/wap", am_files)
 
 
 def run_lmc(action):
@@ -505,33 +539,72 @@ def run_lmc(action):
     attrs = action.attributes
 
     _connect_action_stores(action)
-    os.makedirs("/data/lmc/precip", exist_ok=True)
+    os.makedirs("/data/lmc", exist_ok=True)
     _get_folder(action, "annual_maxima", "/data/lmc")
-    _get_folder(action, "raw_precipitation", "/data/lmc/precip")
+    # Raw precip must land in the LMC cwd (not a subdir): 3.LMC.py globs
+    # "<precip_prefix>*<precip_suffix>" relative to cwd (lines 51, 96).
+    _get_folder(action, "raw_precipitation", "/data/lmc")
     _get_shapefile(action, "watershed_shapefile", "/data/lmc", stem="WS")
 
+    out_key = str(attrs.get("output_key", ""))
     script = os.path.join(SLAM_SUBMODULE_PATH, "3.LMC.py")
-    cmd = [
-        sys.executable,
-        script,
-        str(attrs.get("chunk_index", 0)),
-        str(attrs.get("duration", "24")),
-        str(attrs.get("lat_name", "latitude")),
-        str(attrs.get("lon_name", "longitude")),
-        str(attrs.get("precvar", "precrate")),
-        str(attrs.get("precip_prefix", "")),
-        str(attrs.get("precip_suffix", "")),
-        str(attrs.get("output_key", "")),
-    ]
-    result = subprocess_run(cmd, cwd="/data/lmc")
-    if result != 0:
-        raise RuntimeError(f"LMC failed with return code {result}")
+
+    # 3.LMC.py processes the domain one block of `group_size` (=15) valid-anchor
+    # longitude columns at a time, selected by the chunk index; only the block
+    # holding the basin's home anchor writes WSAM. The canonical pipeline runs
+    # every block in parallel then merges (PostLMC.sh -> 3bp.CombineLMs.py). We
+    # run all blocks sequentially in-process, then merge, so LMs covers the full
+    # domain and WSAM is always produced.
+    import math
+    import xarray as xr
+
+    _GROUP_SIZE = 15
+    am_glob = "/data/lmc/*Maxima.*.nc4"
+    with xr.open_mfdataset(glob.glob(am_glob)) as _am:
+        _lonlist = np.unique(np.where(_am["WAP"].values > 0)[2])
+    n_chunks = max(1, math.ceil(_lonlist.size / _GROUP_SIZE))
+    logger.info(
+        f"LMC: {_lonlist.size} valid-anchor longitude column(s) -> {n_chunks} chunk(s)"
+    )
+
+    for chunk in range(n_chunks):
+        cmd = [
+            sys.executable,
+            script,
+            str(chunk),
+            str(attrs.get("duration", "24")),
+            str(attrs.get("lat_name", "latitude")),
+            str(attrs.get("lon_name", "longitude")),
+            str(attrs.get("precvar", "precrate")),
+            str(attrs.get("precip_prefix", "")),
+            str(attrs.get("precip_suffix", "")),
+            out_key,
+        ]
+        result = subprocess_run(cmd, cwd="/data/lmc")
+        if result != 0:
+            raise RuntimeError(f"LMC chunk {chunk} failed with return code {result}")
+
+    # Merge per-chunk LMCol.<chunk>.<key>.<method>.nc into one LMs.<key>.<method>.nc
+    # (reindex longitude onto the full annual-maxima grid), as 3bp.CombineLMs.py does.
+    with xr.open_mfdataset(glob.glob(am_glob)) as _am:
+        for method in ("mean", "median"):
+            cols = sorted(glob.glob(f"/data/lmc/LMCol.*.{method}.nc"))
+            if not cols:
+                continue
+            with xr.open_mfdataset(cols) as _lm:
+                _lm.reindex(longitude=_am.longitude).to_netcdf(
+                    f"/data/lmc/LMs.{out_key}.{method}.nc"
+                )
+            logger.info(
+                f"merged {len(cols)} LMCol chunk(s) -> LMs.{out_key}.{method}.nc"
+            )
 
     _stage_dir_to_remote(
         action,
         "lm_output",
         "/data/lmc",
-        glob.glob("/data/lmc/LMCol*.nc")
+        glob.glob("/data/lmc/LMs.*.nc")
+        + glob.glob("/data/lmc/LMCol*.nc")
         + glob.glob("/data/lmc/WSAM.*.nc")
         + glob.glob("/data/lmc/WS.*.LMC*.nc"),
     )
@@ -546,6 +619,29 @@ def run_clmpv(action):
     _get_folder(action, "lm_files", "/data/clmpv")
     _get_folder(action, "wsam_files", "/data/clmpv")
     _get_shapefile(action, "watershed_shapefile", "/data/clmpv", stem="WS")
+
+    # 4.CLMPV.py opens exactly one "LMs.*.nc"; LMC emits both mean and median.
+    # Keep only the configured composite method.
+    comp = str(attrs.get("comp_method", "mean"))
+    for f in glob.glob("/data/clmpv/LMs.*.nc"):
+        if not os.path.basename(f).endswith(f".{comp}.nc"):
+            os.remove(f)
+
+    # 4.CLMPV.py (line 213 + get_or_create_wsarray) needs one "*.precip.nc" grid
+    # reference carrying a "precrate" variable. AORC daily files are "AORC.*.nc"
+    # with "APCP_surface", so build a single renamed reference; this reproduces
+    # the same watershed mask LMC derives from a raw precip file.
+    import xarray as xr
+
+    _get_first_from_folder(action, "raw_precipitation", "/data/clmpv/_refsrc.nc")
+    with xr.open_dataset("/data/clmpv/_refsrc.nc") as _ref:
+        _dvar = (
+            "APCP_surface"
+            if "APCP_surface" in _ref.data_vars
+            else list(_ref.data_vars)[0]
+        )
+        _ref.rename({_dvar: "precrate"}).to_netcdf("/data/clmpv/ref.precip.nc")
+    os.remove("/data/clmpv/_refsrc.nc")
 
     values_path = "-"
     domain_mode = attrs.get("domain_mode", "SIM")
