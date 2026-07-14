@@ -534,7 +534,9 @@ def run_pp2wap(action):
         {n[5:9] for n in precip_names if n.startswith("AORC.") and n[5:9].isdigit()}
     )
     if not years:
-        raise RuntimeError("PP2WAP: no AORC.YYYYMMDD.nc precip files found in the store")
+        raise RuntimeError(
+            "PP2WAP: no AORC.YYYYMMDD.nc precip files found in the store"
+        )
     logger.info(
         f"PP2WAP: {len(precip_names)} precip file(s) spanning {len(years)} year(s) "
         f"{years[0]}..{years[-1]}"
@@ -743,6 +745,7 @@ def run_clmpv(action):
         # cccli can deliver a list-valued action attribute as its string repr
         # (e.g. "[10, 20, 30]"); split it back into numeric tokens.
         import re as _re
+
         values = [t for t in _re.split(r"[,\s]+", values.strip("[](){} \t")) if t]
     if domain_mode in ("SIM", "SIG") and values:
         values_file = "/data/clmpv/values.txt"
