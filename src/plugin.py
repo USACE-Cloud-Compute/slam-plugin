@@ -646,6 +646,11 @@ def run_clmpv(action):
     values_path = "-"
     domain_mode = attrs.get("domain_mode", "SIM")
     values = attrs.get("values", [])
+    if isinstance(values, str):
+        # cccli can deliver a list-valued action attribute as its string repr
+        # (e.g. "[10, 20, 30]"); split it back into numeric tokens.
+        import re as _re
+        values = [t for t in _re.split(r"[,\s]+", values.strip("[](){} \t")) if t]
     if domain_mode in ("SIM", "SIG") and values:
         values_file = "/data/clmpv/values.txt"
         with open(values_file, "w") as vf:
