@@ -645,6 +645,7 @@ def run_lmc(action):
     # domain-wide (empty transposition domain). Spatial L-moments pool across the
     # surviving years, so dropping the bad year is the intended recovery.
     import xarray as xr
+
     kept_years, dropped_years = [], []
     for _amf in sorted(glob.glob(os.path.join(lmc, "*Maxima.*.nc4"))):
         with xr.open_dataset(_amf) as _d:
@@ -694,7 +695,9 @@ def run_lmc(action):
                 _day = _day + np.timedelta64(1, "D")
     if needed_precip:
         _get_folder(
-            action, "raw_precipitation", lmc,
+            action,
+            "raw_precipitation",
+            lmc,
             name_filter=lambda b: b in needed_precip,
         )
     else:
