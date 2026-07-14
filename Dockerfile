@@ -19,10 +19,11 @@ RUN python3.12 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
 COPY src src
 
 RUN chown -R slam:slam /usr/src/app
-# /data is the intra-container scratch root the plugin writes to; create it
-# and hand it to slam, since uid 1000 cannot mkdir at the filesystem root.
-RUN mkdir -p /data && chown slam:slam /data
-USER slam
+RUN mkdir -p /data
+# Run as root (do NOT drop to USER slam). The per-workflow /model PVC is mounted
+# root:root 0755 by the kubelet, and a Dockerfile chown cannot affect a runtime
+# mount point (the volume shadows the image dir). Sibling plugins (hms-runner,
+# ressim-runner) run as root for the same reason; uid 1000 gets EACCES on /model.
 
 ENV OMP_NUM_THREADS=1 \
  OPENBLAS_NUM_THREADS=1 \
