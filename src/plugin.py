@@ -636,9 +636,69 @@ def run_lmc(action):
     shutil.rmtree(lmc, ignore_errors=True)
     os.makedirs(lmc, exist_ok=True)
     _get_folder(action, "annual_maxima", lmc)
+
+    # Drop any annual-maxima year whose WAP is entirely invalid before LMC opens
+    # them. A single corrupt all-NaN source precip day empties that year's
+    # watershed mask (shapefile_to_mask requires validity at every timestep), so
+    # PP2WAP/AMC produce an all-NaN annual maximum for that year. Left in place it
+    # makes 3.LMC.py's all-years np.min(WAP) NaN and selects zero anchors
+    # domain-wide (empty transposition domain). Spatial L-moments pool across the
+    # surviving years, so dropping the bad year is the intended recovery.
+    import xarray as xr
+    kept_years, dropped_years = [], []
+    for _amf in sorted(glob.glob(os.path.join(lmc, "*Maxima.*.nc4"))):
+        with xr.open_dataset(_amf) as _d:
+            _wap = _d["WAP"].values
+            _yrs = [int(y) for y in np.atleast_1d(_d["year"].values)]
+        if np.all(~np.isfinite(_wap)):
+            os.remove(_amf)
+            dropped_years.extend(_yrs)
+        else:
+            kept_years.extend(_yrs)
+    if dropped_years:
+        logger.info(
+            f"LMC: dropped {len(dropped_years)} all-NaN annual-maxima year(s) "
+            f"{sorted(dropped_years)}; {len(kept_years)} year(s) remain"
+        )
+
+    # Stage only the raw precip days each surviving annual maximum actually needs.
+    # 3.LMC.py's fast_masked_LMs reads a D-hour window per anchor/year, bounded by
+    # the annual maximum's WAM_start/WAM_end timestamps. Stage only the calendar
+    # days those windows span (instead of the whole multi-decade record): it holds
+    # 3.LMC.py's AMFilesSlice[...].values to ~2 GB rather than the ~11 GB that
+    # OOM-kills the pod, and cuts the download ~6x. A window's days are
+    # consecutive, so every window stays contiguous on the time axis and the
+    # timestamp lookups in fast_masked_LMs stay exact. Days come from the
+    # WAM_start/WAM_end range (floored to date), NOT the AM `file_days` variable:
+    # file_days is built with a 01:00-00:00 file convention while the AORC daily
+    # files hold 00:00-23:00, so file_days mislabels a window's boundary day and
+    # would drop one hour (a 71-of-72 window) at the edge.
     # Raw precip must land in the LMC cwd (not a subdir): 3.LMC.py globs
     # "<precip_prefix>*<precip_suffix>" relative to cwd (lines 51, 96).
-    _get_folder(action, "raw_precipitation", lmc)
+    precip_prefix = str(attrs.get("precip_prefix", ""))
+    precip_suffix = str(attrs.get("precip_suffix", ""))
+    needed_precip = set()
+    for _amf in sorted(glob.glob(os.path.join(lmc, "*Maxima.*.nc4"))):
+        with xr.open_dataset(_amf) as _d:
+            _ws = _d["WAM_start"].values.astype("datetime64[ns]").ravel()
+            _we = _d["WAM_end"].values.astype("datetime64[ns]").ravel()
+        for _si, _ei in zip(_ws, _we):
+            if np.isnat(_si) or np.isnat(_ei):
+                continue
+            _day = _si.astype("datetime64[D]")
+            _last = _ei.astype("datetime64[D]")
+            while _day <= _last:
+                needed_precip.add(
+                    f"{precip_prefix}{str(_day).replace('-', '')}{precip_suffix}"
+                )
+                _day = _day + np.timedelta64(1, "D")
+    if needed_precip:
+        _get_folder(
+            action, "raw_precipitation", lmc,
+            name_filter=lambda b: b in needed_precip,
+        )
+    else:
+        _get_folder(action, "raw_precipitation", lmc)
     _get_shapefile(action, "watershed_shapefile", lmc, stem="WS")
 
     out_key = str(attrs.get("output_key", ""))
