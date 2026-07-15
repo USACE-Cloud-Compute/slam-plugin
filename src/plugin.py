@@ -520,6 +520,91 @@ def run_geojson_to_shp(action):
 # ---------------------------------------------------------------------------
 # SLAM pipeline actions (folder-aware watershed + precip staging)
 # ---------------------------------------------------------------------------
+def _fill_indomain_nan_gaps(work_dir, precvar, pattern):
+    """Repair AORC data-gap NaNs in staged precip before a stage that sums raw
+    precip over the basin polygon (PP2WAP, LMC). The mirror has NaN patches on
+    isolated storm days; because those stages require every basin cell finite at
+    every window timestep, one corrupt cell can void an anchor/mask cell across
+    the whole record. Fill NaN with 0 only over IN-DOMAIN cells -- the domain is
+    the set of cells finite in the majority of a file sample, so genuine
+    off-domain cells (NaN in every file) stay NaN and the true domain boundary
+    (hence the valid-anchor set) is preserved. Returns the number of files
+    rewritten."""
+    import numpy as np
+    import xarray as xr
+
+    files = sorted(glob.glob(os.path.join(work_dir, pattern)))
+    if len(files) < 2:
+        return 0
+    sample = files[:: max(1, len(files) // 40)]
+    acc = None
+    for pf in sample:
+        with xr.open_dataset(pf) as ds:
+            fin = np.isfinite(ds[precvar].isel(time=0).values).astype(np.int32)
+        acc = fin if acc is None else acc + fin
+    domain = acc >= (len(sample) // 2 + 1)
+    filled = 0
+    for pf in files:
+        ds = xr.open_dataset(pf)
+        ds.load()
+        ds.close()
+        arr = ds[precvar].values
+        bad = ~np.isfinite(arr) & domain[None, :, :]
+        if bad.any():
+            arr[bad] = 0.0
+            tmp = pf + ".tmp"
+            ds.to_netcdf(tmp)
+            ds.close()
+            os.replace(tmp, pf)
+            filled += 1
+    return filled
+
+
+def _fill_ref_nan_in_basin(ref_path, precvar, shp_path):
+    """Fill NaN with 0 inside the watershed polygon of a single grid-reference
+    precip file, so a corrupt reference day cannot drop basin cells from the
+    CLMPV watershed mask (shapefile_to_mask excludes a cell NaN at any timestep).
+    Returns the basin cell count if anything was filled, else 0."""
+    import numpy as np
+    import xarray as xr
+    import geopandas as gpd
+    from rasterio import features
+    from affine import Affine
+
+    ds = xr.open_dataset(ref_path)
+    ds.load()
+    ds.close()
+    lon = ds["longitude"].values
+    lat = ds["latitude"].values
+    shp = gpd.read_file(shp_path)
+    lon_res = (lon[-1] - lon[0]) / (len(lon) - 1)
+    lat_res = (lat[-1] - lat[0]) / (len(lat) - 1)
+    transform = Affine.translation(
+        lon[0] - lon_res / 2, lat[0] - lat_res / 2
+    ) * Affine.scale(lon_res, lat_res)
+    basin = (
+        features.rasterize(
+            ((geom, 1) for geom in shp.geometry),
+            out_shape=(len(lat), len(lon)),
+            transform=transform,
+            fill=0,
+            all_touched=True,
+            dtype="float32",
+        )
+        == 1
+    )
+    arr = ds[precvar].values
+    bad = ~np.isfinite(arr) & basin[None, :, :]
+    if not bad.any():
+        return 0
+    arr[bad] = 0.0
+    tmp = ref_path + ".tmp"
+    ds.to_netcdf(tmp)
+    ds.close()
+    os.replace(tmp, ref_path)
+    return int(basin.sum())
+
+
 def run_pp2wap(action):
     logger.info("STAGE 1: PP2WAP")
     attrs = action.attributes
@@ -554,6 +639,16 @@ def run_pp2wap(action):
             work,
             name_filter=lambda b, y=year: b.startswith(f"AORC.{y}"),
         )
+        # Repair AORC data gaps before PP2WAP so a corrupt day cannot empty this
+        # year's watershed mask (shapefile_to_mask requires every timestep finite);
+        # an all-NaN day would otherwise void the whole year's WAP/annual maximum.
+        _yf = _fill_indomain_nan_gaps(
+            work, str(attrs.get("precvar", "precrate")), "AORC.*.nc"
+        )
+        if _yf:
+            logger.info(
+                f"PP2WAP year {year}: filled in-domain NaN gaps in {_yf} file(s)"
+            )
         cmd = [
             sys.executable,
             script,
@@ -713,33 +808,10 @@ def run_lmc(action):
     # cells with 0 before LMC: a cell's spatial L-moment averages over all years, so
     # one 0-filled bad day is negligible, while genuine off-domain cells (NaN in
     # every file) are left untouched so the valid-anchor set is unchanged.
-    precvar = str(attrs.get("precvar", "precrate"))
-    _pfiles = sorted(glob.glob(os.path.join(lmc, f"{precip_prefix}*{precip_suffix}")))
-    if _pfiles:
-        _sample = _pfiles[:: max(1, len(_pfiles) // 40)]
-        _acc = None
-        for _pf in _sample:
-            with xr.open_dataset(_pf) as _pd:
-                _fin = np.isfinite(_pd[precvar].isel(time=0).values).astype(np.int32)
-            _acc = _fin if _acc is None else _acc + _fin
-        _domain = _acc >= (len(_sample) // 2 + 1)
-        _filled = 0
-        for _pf in _pfiles:
-            _pd = xr.open_dataset(_pf)
-            _pd.load()
-            _pd.close()
-            _a = _pd[precvar].values
-            _bad = ~np.isfinite(_a) & _domain[None, :, :]
-            if _bad.any():
-                _a[_bad] = 0.0
-                _tmp = _pf + ".tmp"
-                _pd.to_netcdf(_tmp)
-                _pd.close()
-                os.replace(_tmp, _pf)
-                _filled += 1
-        logger.info(
-            f"LMC: filled in-domain NaN gaps in {_filled} of {len(_pfiles)} precip file(s)"
-        )
+    _filled = _fill_indomain_nan_gaps(
+        lmc, str(attrs.get("precvar", "precrate")), f"{precip_prefix}*{precip_suffix}"
+    )
+    logger.info(f"LMC: filled in-domain NaN gaps in {_filled} precip file(s)")
 
     _get_shapefile(action, "watershed_shapefile", lmc, stem="WS")
 
@@ -839,6 +911,16 @@ def run_clmpv(action):
         )
         _ref.rename({_dvar: "precrate"}).to_netcdf("/data/clmpv/ref.precip.nc")
     os.remove("/data/clmpv/_refsrc.nc")
+    # A corrupt reference day would drop basin cells from the CLMPV watershed mask
+    # (shapefile_to_mask excludes any cell NaN at a timestep); fill NaN with 0 inside
+    # the watershed polygon so the mask matches the shapefile regardless of the day.
+    _rf = _fill_ref_nan_in_basin(
+        "/data/clmpv/ref.precip.nc", "precrate", "/data/clmpv/WS.shp"
+    )
+    if _rf:
+        logger.info(
+            f"CLMPV: filled NaN gaps in {_rf} basin cell(s) of the grid reference"
+        )
 
     values_path = "-"
     domain_mode = attrs.get("domain_mode", "SIM")
