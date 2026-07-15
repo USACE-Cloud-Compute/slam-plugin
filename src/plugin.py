@@ -702,6 +702,45 @@ def run_lmc(action):
         )
     else:
         _get_folder(action, "raw_precipitation", lmc)
+
+    # AORC mirror data quality: some storm days carry NaN patches over in-domain
+    # cells (e.g. 1985-11-07, 2003-10-19). 3.LMC.py sums raw precip over the whole
+    # basin polygon and requires every year's annual-max window to be finite, so a
+    # single corrupt cell NaNs the L-moment of every anchor whose footprint covers
+    # it -> over a multi-decade record the domain-wide L-moment field collapses to a
+    # handful of cells and the transposition domain cannot grow (a clean 5-year
+    # window hides this; the full record exposes it). Fill in-domain NaN precip
+    # cells with 0 before LMC: a cell's spatial L-moment averages over all years, so
+    # one 0-filled bad day is negligible, while genuine off-domain cells (NaN in
+    # every file) are left untouched so the valid-anchor set is unchanged.
+    precvar = str(attrs.get("precvar", "precrate"))
+    _pfiles = sorted(glob.glob(os.path.join(lmc, f"{precip_prefix}*{precip_suffix}")))
+    if _pfiles:
+        _sample = _pfiles[:: max(1, len(_pfiles) // 40)]
+        _acc = None
+        for _pf in _sample:
+            with xr.open_dataset(_pf) as _pd:
+                _fin = np.isfinite(_pd[precvar].isel(time=0).values).astype(np.int32)
+            _acc = _fin if _acc is None else _acc + _fin
+        _domain = _acc >= (len(_sample) // 2 + 1)
+        _filled = 0
+        for _pf in _pfiles:
+            _pd = xr.open_dataset(_pf)
+            _pd.load()
+            _pd.close()
+            _a = _pd[precvar].values
+            _bad = ~np.isfinite(_a) & _domain[None, :, :]
+            if _bad.any():
+                _a[_bad] = 0.0
+                _tmp = _pf + ".tmp"
+                _pd.to_netcdf(_tmp)
+                _pd.close()
+                os.replace(_tmp, _pf)
+                _filled += 1
+        logger.info(
+            f"LMC: filled in-domain NaN gaps in {_filled} of {len(_pfiles)} precip file(s)"
+        )
+
     _get_shapefile(action, "watershed_shapefile", lmc, stem="WS")
 
     out_key = str(attrs.get("output_key", ""))
